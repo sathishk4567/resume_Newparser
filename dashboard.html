@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Resume Intake Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">Resume Intake</div>
+    <div class="topbar-right">
+      <span class="who">Signed in as <strong>{{ session['username'] }}</strong></span>
+      <a class="btn secondary small" href="{{ url_for('logout') }}">Log out</a>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="hero">
+    <div class="eyebrow">Batch resume intake</div>
+    <h1>Upload resumes.<br><span class="hl">Everything lands here.</span></h1>
+    <p class="sub">Drop in PDFs or Word docs. Each one is read, parsed, and saved straight to the database — no spreadsheet juggling.</p>
+  </div>
+
+  <div class="tray" id="tray">
+    <h3>Drag resumes here</h3>
+    <p>or choose files individually, or select a whole folder at once</p>
+    <div class="btn-row">
+      <button class="btn" type="button" id="chooseFilesBtn">Choose Files</button>
+      <button class="btn secondary" type="button" id="chooseFolderBtn">Choose Folder</button>
+    </div>
+    <input type="file" id="fileInput" multiple accept=".pdf,.docx">
+    <input type="file" id="folderInput" webkitdirectory directory multiple>
+  </div>
+
+  {% if ai_enabled %}
+    <p class="note">AI-enhanced parsing is active on the server for all uploads.</p>
+  {% else %}
+    <p class="note">Using the built-in pattern-matching parser. To turn on higher-accuracy AI parsing for every upload automatically, set an <code>ANTHROPIC_API_KEY</code> environment variable on the server — no code changes needed.</p>
+  {% endif %}
+
+  <div class="queue" id="queue">
+    <div class="rows" id="rows"></div>
+  </div>
+
+  <div class="results-head">
+    <h4>Candidates ({{ candidates|length }})</h4>
+    <a class="btn" href="{{ url_for('export') }}">Download Excel</a>
+  </div>
+
+  <input type="text" id="searchBox" class="search-box" placeholder="Search by name, title, skill, email, location, visa status…">
+
+  <table id="candidateTable">
+    <thead>
+      <tr><th>Name</th><th>Title</th><th>Contact</th><th>Location</th><th>Visa Status</th><th>Experience</th><th>Skills</th><th></th></tr>
+    </thead>
+    <tbody id="tableBody">
+      {% for c in candidates %}
+      {% set searchable = (c['name'] or '') ~ ' ' ~ (c['current_title'] or '') ~ ' ' ~ (c['skills'] or '') ~ ' ' ~ (c['email'] or '') ~ ' ' ~ (c['location'] or '') ~ ' ' ~ (c['visa_status'] or '') %}
+      <tr data-search="{{ searchable | lower }}">
+        <td><strong>{{ c['name'] or '—' }}</strong></td>
+        <td>{{ c['current_title'] or '—' }}</td>
+        <td>{{ c['email'] }}{% if c['phone'] %} · {{ c['phone'] }}{% endif %}</td>
+        <td>{{ c['location'] or '—' }}</td>
+        <td>{{ c['visa_status'] or '—' }}</td>
+        <td>{{ c['years_experience'] or '—' }}</td>
+        <td class="skills-cell">{{ c['skills'] or '—' }}</td>
+        <td>
+          <form method="POST" action="{{ url_for('delete_candidate', candidate_id=c['id']) }}" onsubmit="return confirm('Remove this candidate?');">
+            <button class="link-btn" type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="8">No resumes uploaded yet.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="note">Visa status is only filled in when a resume explicitly states work authorization (e.g. "US Citizen," "H-1B," "requires sponsorship") — it's never guessed from a name or location.</p>
+
+  <details class="team-panel">
+    <summary>Add a teammate</summary>
+    <form method="POST" action="{{ url_for('add_user') }}" class="inline-form">
+      <input type="text" name="username" placeholder="Username" required>
+      <input type="password" name="password" placeholder="Password" required>
+      <button class="btn secondary" type="submit">Add</button>
+    </form>
+    <p class="hint">Current users: {{ users|map(attribute='username')|join(', ') }}</p>
+  </details>
+
+</div>
+
+<script>
+const tray = document.getElementById('tray');
+const fileInput = document.getElementById('fileInput');
+const folderInput = document.getElementById('folderInput');
+const queueEl = document.getElementById('queue');
+const rowsEl = document.getElementById('rows');
+
+document.getElementById('chooseFilesBtn').onclick = () => fileInput.click();
+document.getElementById('chooseFolderBtn').onclick = () => folderInput.click();
+fileInput.onchange = e => handleFiles(e.target.files);
+folderInput.onchange = e => handleFiles(e.target.files);
+
+['dragenter','dragover'].forEach(ev => tray.addEventListener(ev, e => { e.preventDefault(); tray.classList.add('drag'); }));
+['dragleave','drop'].forEach(ev => tray.addEventListener(ev, e => { e.preventDefault(); tray.classList.remove('drag'); }));
+tray.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+
+function escapeHtml(str){
+  return (str||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function handleFiles(fileList){
+  const valid = Array.from(fileList).filter(f => /\.pdf$/i.test(f.name) || /\.docx$/i.test(f.name));
+  if(!valid.length) return;
+
+  queueEl.classList.add('show');
+  rowsEl.innerHTML = valid.map((f,i) => `
+    <div class="row" id="row-${i}">
+      <div class="dot working"></div>
+      <div class="name">${escapeHtml(f.name)}</div>
+      <div class="status working">Uploading…</div>
+    </div>
+  `).join('');
+
+  const formData = new FormData();
+  valid.forEach(f => formData.append('resumes', f));
+
+  try{
+    const resp = await fetch('/upload', { method: 'POST', body: formData });
+    const data = await resp.json();
+    (data.results || []).forEach((r, i) => {
+      const row = document.getElementById(`row-${i}`);
+      if(!row) return;
+      const dot = row.querySelector('.dot');
+      const status = row.querySelector('.status');
+      dot.className = 'dot ' + (r.status === 'done' ? 'done' : 'error');
+      status.className = 'status ' + (r.status === 'done' ? 'done' : 'error');
+      status.textContent = r.status === 'done' ? 'Done' : (r.reason || 'Error');
+    });
+    setTimeout(() => window.location.reload(), 900);
+  }catch(err){
+    rowsEl.innerHTML = `<div class="row"><div class="dot error"></div><div class="name">Upload failed</div><div class="status error">${escapeHtml(err.message)}</div></div>`;
+  }
+}
+
+document.getElementById('searchBox').addEventListener('input', e => {
+  const q = e.target.value.toLowerCase().trim();
+  document.querySelectorAll('#tableBody tr').forEach(row => {
+    if(!row.dataset.search) return;
+    row.style.display = row.dataset.search.includes(q) ? '' : 'none';
+  });
+});
+</script>
+</body>
+</html>
