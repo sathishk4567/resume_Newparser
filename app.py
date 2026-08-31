@@ -78,6 +78,18 @@ def init_db():
         highlights TEXT,
         FOREIGN KEY(candidate_id) REFERENCES candidates(id)
     );
+
+    CREATE TABLE IF NOT EXISTS requirements (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        label TEXT,
+        raw_text TEXT,
+        title TEXT,
+        location TEXT,
+        skills TEXT,
+        visa_status TEXT,
+        created_by TEXT,
+        created_at TEXT
+    );
     """)
     conn.commit()
 
@@ -338,6 +350,201 @@ def parse_with_claude(text):
 
 
 # ---------------------------------------------------------------- routes
+def build_candidate_filter(args):
+    """Build a WHERE clause + params list from request query args for candidate search."""
+    clauses = []
+    params = []
+    field_map = {
+        "name": "name",
+        "location": "location",
+        "visa_status": "visa_status",
+        "skills": "skills",
+        "title": "current_title",
+        "email": "email",
+    }
+    for arg_key, col in field_map.items():
+        val = (args.get(arg_key) or "").strip()
+        if val:
+            clauses.append(f"{col} LIKE ?")
+            params.append(f"%{val}%")
+    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where_sql, params
+
+
+@app.route("/search")
+@login_required
+def search():
+    where_sql, params = build_candidate_filter(request.args)
+    conn = get_db()
+    candidates = conn.execute(
+        f"SELECT * FROM candidates{where_sql} ORDER BY uploaded_at DESC", params
+    ).fetchall()
+    conn.close()
+    has_query = any((request.args.get(k) or "").strip() for k in
+                     ["name", "location", "visa_status", "skills", "title", "email"])
+    return render_template("search.html", candidates=candidates, args=request.args, has_query=has_query)
+
+
+def parse_requirement_heuristic(text):
+    # split on newlines AND sentence boundaries, since requirements are often pasted as one paragraph
+    lines = [l.strip() for l in re.split(r"[\r\n]+|(?<=[.;])\s+", text) if l.strip()]
+    joined = "\n".join(lines)
+
+    def labeled(pattern):
+        m = re.search(pattern, joined, re.I)
+        return m.group(1).strip()[:80] if m else ""
+
+    title = labeled(r"(?:job\s*title|title|position|role)\s*[:\-]\s*(.+)")
+    location = labeled(r"location\s*[:\-]\s*(.+)")
+    skills_line = labeled(r"(?:required\s*skills|skills|tech\s*stack|requirements?)\s*[:\-]\s*(.+)")
+    visa_line = labeled(r"(?:visa|work\s*authorization|sponsorship)\s*[:\-]\s*(.+)")
+
+    if not location:
+        location = next(iter(re.findall(
+            r"\b[A-Z][a-zA-Z.]+(?:\s[A-Z][a-zA-Z.]+)*,\s?[A-Z]{2}\b", joined)), "")
+
+    if not title:
+        for l in lines[:5]:
+            if any(k in l for k in TITLE_KEYWORDS) and len(l) < 80:
+                title = l
+                break
+        if not title and lines:
+            title = lines[0][:80]
+
+    if skills_line:
+        skills = ", ".join(s.strip() for s in re.split(r",|/|;", skills_line) if s.strip())
+    else:
+        found = [s.replace("\\", "") for s in SKILLS_DICT if re.search(r"\b" + s + r"\b", joined, re.I)]
+        skills = ", ".join(found[:20])
+
+    visa_status = visa_line if visa_line else detect_visa_status(joined)
+
+    return {"title": title, "location": location, "skills": skills, "visa_status": visa_status}
+
+
+def parse_requirement_with_claude(text):
+    system = (
+        'You extract structured hiring criteria from a job requirement or job description. '
+        'Respond with ONLY a raw JSON object, no markdown fences, no commentary. Schema: '
+        '{"title":"job title being hired for","location":"required work location, empty if remote/unspecified",'
+        '"skills":"comma-separated list of required or preferred technical skills",'
+        '"visa_status":"work authorization or visa requirement if mentioned, e.g. \'US Citizen only\', '
+        '\'no sponsorship\', \'H-1B ok\' — empty string if not mentioned"} '
+        'Use empty string "" for any field not present. Do not invent information.'
+    )
+    resp = requests.post(
+        "https://api.anthropic.com/v1/messages",
+        headers={
+            "Content-Type": "application/json",
+            "x-api-key": ANTHROPIC_API_KEY,
+            "anthropic-version": "2023-06-01",
+        },
+        json={
+            "model": "claude-sonnet-4-6",
+            "max_tokens": 500,
+            "system": system,
+            "messages": [{"role": "user", "content": text[:8000]}]
+        },
+        timeout=60
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    text_block = next((b for b in data.get("content", []) if b.get("type") == "text"), None)
+    if not text_block:
+        raise ValueError("No response from AI parser")
+    clean = text_block["text"].strip()
+    clean = re.sub(r"^```json", "", clean, flags=re.I).strip()
+    clean = re.sub(r"^```", "", clean).strip()
+    clean = re.sub(r"```$", "", clean).strip()
+    return json.loads(clean)
+
+
+def score_candidates_against_requirement(req_row, candidates):
+    req_skills = [s.strip().lower() for s in (req_row["skills"] or "").split(",") if s.strip()]
+    req_location = (req_row["location"] or "").strip().lower()
+    req_visa = (req_row["visa_status"] or "").strip().lower()
+
+    scored = []
+    for c in candidates:
+        if req_location and req_location not in (c["location"] or "").lower():
+            continue
+        if req_visa and req_visa not in (c["visa_status"] or "").lower():
+            continue
+        cand_skills = [s.strip().lower() for s in (c["skills"] or "").split(",") if s.strip()]
+        overlap = sorted(set(req_skills) & set(cand_skills))
+        if req_skills and not overlap:
+            continue
+        scored.append({"candidate": c, "match_count": len(overlap), "matched_skills": overlap})
+
+    scored.sort(key=lambda r: r["match_count"], reverse=True)
+    return scored
+
+
+@app.route("/requirements", methods=["GET", "POST"])
+@login_required
+def requirements():
+    conn = get_db()
+    if request.method == "POST":
+        raw_text = request.form.get("raw_text", "").strip()
+        if not raw_text:
+            flash("Paste a job requirement first.")
+            conn.close()
+            return redirect(url_for("requirements"))
+
+        if ANTHROPIC_API_KEY:
+            try:
+                parsed = parse_requirement_with_claude(raw_text)
+            except Exception:
+                parsed = parse_requirement_heuristic(raw_text)
+        else:
+            parsed = parse_requirement_heuristic(raw_text)
+
+        label = (parsed.get("title") or raw_text[:60]).strip()
+        cur = conn.execute(
+            """INSERT INTO requirements (label, raw_text, title, location, skills, visa_status,
+               created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (label, raw_text, parsed.get("title", ""), parsed.get("location", ""),
+             parsed.get("skills", ""), parsed.get("visa_status", ""),
+             session.get("username", ""), datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        req_id = cur.lastrowid
+        conn.close()
+        return redirect(url_for("view_requirement", req_id=req_id))
+
+    saved = conn.execute("SELECT * FROM requirements ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return render_template("requirements.html", saved=saved, current=None, matches=None,
+                            ai_enabled=bool(ANTHROPIC_API_KEY))
+
+
+@app.route("/requirements/<int:req_id>")
+@login_required
+def view_requirement(req_id):
+    conn = get_db()
+    current = conn.execute("SELECT * FROM requirements WHERE id = ?", (req_id,)).fetchone()
+    if not current:
+        conn.close()
+        flash("That saved requirement no longer exists.")
+        return redirect(url_for("requirements"))
+    candidates = conn.execute("SELECT * FROM candidates ORDER BY uploaded_at DESC").fetchall()
+    saved = conn.execute("SELECT * FROM requirements ORDER BY created_at DESC").fetchall()
+    conn.close()
+    matches = score_candidates_against_requirement(current, candidates)
+    return render_template("requirements.html", saved=saved, current=current, matches=matches,
+                            ai_enabled=bool(ANTHROPIC_API_KEY))
+
+
+@app.route("/requirements/<int:req_id>/delete", methods=["POST"])
+@login_required
+def delete_requirement(req_id):
+    conn = get_db()
+    conn.execute("DELETE FROM requirements WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+    return redirect(url_for("requirements"))
+
+
 @app.route("/")
 @login_required
 def dashboard():
@@ -358,15 +565,16 @@ def upload():
     for f in files:
         if not f or not f.filename:
             continue
-        ext = os.path.splitext(f.filename)[1].lower()
-        if ext not in ALLOWED_EXT:
-            results.append({"filename": f.filename, "status": "skipped", "reason": "unsupported file type"})
-            continue
-        safe_name = secure_filename(f.filename)
-        save_path = os.path.join(UPLOAD_DIR, f"{datetime.utcnow().timestamp()}_{safe_name}")
-        f.save(save_path)
-
+        save_path = None
         try:
+            ext = os.path.splitext(f.filename)[1].lower()
+            if ext not in ALLOWED_EXT:
+                results.append({"filename": f.filename, "status": "skipped", "reason": "unsupported file type"})
+                continue
+            safe_name = secure_filename(f.filename)
+            save_path = os.path.join(UPLOAD_DIR, f"{datetime.utcnow().timestamp()}_{safe_name}")
+            f.save(save_path)
+
             text = extract_text(save_path)
             if not text or len(text.strip()) < 20:
                 raise ValueError("No readable text found (possibly a scanned/image-only file)")
@@ -401,14 +609,32 @@ def upload():
             conn.commit()
             results.append({"filename": f.filename, "status": "done"})
         except Exception as e:
-            results.append({"filename": f.filename, "status": "error", "reason": str(e)})
+            conn.rollback()
+            results.append({"filename": f.filename, "status": "error", "reason": str(e)[:200]})
         finally:
-            try:
-                os.remove(save_path)
-            except OSError:
-                pass
+            if save_path:
+                try:
+                    os.remove(save_path)
+                except OSError:
+                    pass
     conn.close()
     return jsonify({"results": results})
+
+
+@app.errorhandler(500)
+def handle_500(e):
+    if request.path.startswith("/upload"):
+        return jsonify({"results": [{"filename": "", "status": "error",
+                                      "reason": "Server error — check Render logs for details"}]}), 500
+    return e
+
+
+@app.errorhandler(413)
+def handle_413(e):
+    if request.path.startswith("/upload"):
+        return jsonify({"results": [{"filename": "", "status": "error",
+                                      "reason": "File too large (25MB limit per request)"}]}), 413
+    return e
 
 
 @app.route("/candidate/<int:candidate_id>/delete", methods=["POST"])
@@ -425,9 +651,19 @@ def delete_candidate(candidate_id):
 @app.route("/export")
 @login_required
 def export():
+    where_sql, params = build_candidate_filter(request.args)
     conn = get_db()
-    candidates = conn.execute("SELECT * FROM candidates ORDER BY uploaded_at DESC").fetchall()
-    experiences = conn.execute("SELECT * FROM experience").fetchall()
+    candidates = conn.execute(
+        f"SELECT * FROM candidates{where_sql} ORDER BY uploaded_at DESC", params
+    ).fetchall()
+    candidate_ids = [c["id"] for c in candidates]
+    if candidate_ids:
+        placeholders = ",".join("?" * len(candidate_ids))
+        experiences = conn.execute(
+            f"SELECT * FROM experience WHERE candidate_id IN ({placeholders})", candidate_ids
+        ).fetchall()
+    else:
+        experiences = []
     conn.close()
 
     wb = openpyxl.Workbook()
