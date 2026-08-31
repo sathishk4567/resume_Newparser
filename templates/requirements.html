@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Job Requirements — Resume Intake</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">Resume Intake</div>
+    <div class="topbar-right">
+      <a class="btn secondary small" href="{{ url_for('dashboard') }}">Upload</a>
+      <a class="btn secondary small" href="{{ url_for('search') }}">Search</a>
+      <span class="who">Signed in as <strong>{{ session['username'] }}</strong></span>
+      <a class="btn secondary small" href="{{ url_for('logout') }}">Log out</a>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="hero">
+    <div class="eyebrow">Job requirements</div>
+    <h1>Paste a requirement.<br><span class="hl">Get ranked matches.</span></h1>
+    <p class="sub">Paste a job description or requirement below. Skills, location, and visa needs are pulled out automatically and saved, so next time you get the same req you can jump straight to matching candidates.</p>
+  </div>
+
+  {% with messages = get_flashed_messages() %}
+    {% if messages %}<p class="note">{{ messages[0] }}</p>{% endif %}
+  {% endwith %}
+
+  <form method="POST" action="{{ url_for('requirements') }}" class="filter-panel">
+    <label style="display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:8px;">Paste job requirement / description</label>
+    <textarea name="raw_text" rows="7" placeholder="e.g. Senior Backend Engineer — Austin, TX. Required: Python, FastAPI, PostgreSQL, AWS. Must be a US Citizen or Green Card holder, no sponsorship available." required></textarea>
+    <div class="filter-actions">
+      <button class="btn" type="submit">Parse &amp; Match Candidates</button>
+    </div>
+  </form>
+  {% if not ai_enabled %}
+    <p class="note">Using the built-in pattern-matching extractor. Set an <code>ANTHROPIC_API_KEY</code> environment variable on the server for more accurate extraction on loosely-worded requirements.</p>
+  {% endif %}
+
+  {% if current %}
+    <div class="results-head">
+      <h4>{{ current['label'] }}</h4>
+      <form method="POST" action="{{ url_for('delete_requirement', req_id=current['id']) }}" onsubmit="return confirm('Delete this saved requirement?');">
+        <button class="link-btn" type="submit">Delete this requirement</button>
+      </form>
+    </div>
+    <div class="req-criteria">
+      <div><span class="req-label">Title</span>{{ current['title'] or '—' }}</div>
+      <div><span class="req-label">Location</span>{{ current['location'] or 'Any' }}</div>
+      <div><span class="req-label">Visa</span>{{ current['visa_status'] or 'Any' }}</div>
+      <div><span class="req-label">Skills</span>{{ current['skills'] or '—' }}</div>
+    </div>
+
+    <div class="results-head">
+      <h4>{{ matches|length }} matching candidate{{ '' if matches|length == 1 else 's' }}</h4>
+    </div>
+    <table>
+      <thead>
+        <tr><th>Match</th><th>Name</th><th>Title</th><th>Contact</th><th>Location</th><th>Visa Status</th><th>Matched Skills</th></tr>
+      </thead>
+      <tbody>
+        {% for m in matches %}
+        {% set c = m['candidate'] %}
+        <tr>
+          <td><span class="match-pill">{{ m['match_count'] }}</span></td>
+          <td><strong>{{ c['name'] or '—' }}</strong></td>
+          <td>{{ c['current_title'] or '—' }}</td>
+          <td>{{ c['email'] }}{% if c['phone'] %} · {{ c['phone'] }}{% endif %}</td>
+          <td>{{ c['location'] or '—' }}</td>
+          <td>{{ c['visa_status'] or '—' }}</td>
+          <td class="skills-cell">{{ m['matched_skills']|join(', ') or '—' }}</td>
+        </tr>
+        {% else %}
+        <tr class="empty-row"><td colspan="7">No candidates match this requirement's location, visa, or skill criteria.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  {% endif %}
+
+  {% if saved %}
+    <div class="results-head">
+      <h4>Saved requirements</h4>
+    </div>
+    <div class="req-list">
+      {% for r in saved %}
+      <a class="req-card {{ 'active' if current and current['id'] == r['id'] else '' }}" href="{{ url_for('view_requirement', req_id=r['id']) }}">
+        <div class="req-card-title">{{ r['label'] }}</div>
+        <div class="req-card-meta">
+          {{ r['location'] or 'Any location' }} · {{ r['visa_status'] or 'Any visa' }}
+        </div>
+        <div class="req-card-skills">{{ r['skills'] or 'No skills extracted' }}</div>
+      </a>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+</div>
+</body>
+</html>
