@@ -120,6 +120,46 @@ tbody tr:last-child td{border-bottom:none;}
 .link-btn{background:none;border:none;color:var(--error);font-size:12.5px;cursor:pointer;font-family:'Inter',sans-serif;padding:0;}
 .empty-row td{color:var(--muted);text-align:center;padding:26px;}
 
+/* ---------- Search filter panel ---------- */
+.filter-panel{
+  margin-top:32px;background:var(--paper-raised);border:1px solid var(--line);border-radius:var(--radius);
+  padding:24px 28px;
+}
+.filter-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;}
+.filter-grid label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px;}
+.filter-grid input{
+  width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:6px;
+  font-family:'Inter',sans-serif;font-size:13.5px;
+}
+.filter-actions{display:flex;gap:12px;margin-top:20px;flex-wrap:wrap;}
+.filter-panel textarea{
+  width:100%;padding:12px 14px;border:1px solid var(--line);border-radius:7px;
+  font-family:'Inter',sans-serif;font-size:14px;resize:vertical;
+}
+
+/* ---------- Requirements ---------- */
+.req-criteria{
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;
+  background:var(--paper-raised);border:1px solid var(--line);border-radius:var(--radius);
+  padding:18px 22px;margin-bottom:20px;font-size:14px;
+}
+.req-label{display:block;font-family:'IBM Plex Mono',monospace;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin-bottom:4px;}
+.match-pill{
+  display:inline-flex;align-items:center;justify-content:center;
+  min-width:24px;height:24px;padding:0 7px;border-radius:20px;
+  background:#EAF4F2;color:var(--teal);font-family:'IBM Plex Mono',monospace;font-size:12px;font-weight:600;
+}
+.req-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px;}
+.req-card{
+  display:block;background:var(--paper-raised);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px 18px;text-decoration:none;color:var(--ink);transition:border-color .15s ease;
+}
+.req-card:hover{border-color:var(--amber-deep);}
+.req-card.active{border-color:var(--teal);background:#F3FAF9;}
+.req-card-title{font-family:'Fraunces',serif;font-weight:500;font-size:15px;margin-bottom:6px;}
+.req-card-meta{font-size:12px;color:var(--muted);margin-bottom:8px;}
+.req-card-skills{font-size:12px;color:var(--teal);line-height:1.4;}
+
 /* ---------- Team panel ---------- */
 .team-panel{margin-top:34px;background:var(--paper-raised);border:1px solid var(--line);border-radius:var(--radius);padding:16px 20px;}
 .team-panel summary{cursor:pointer;font-weight:600;font-size:13.5px;}
