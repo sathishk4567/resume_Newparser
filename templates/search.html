@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Search Candidates — Resume Intake</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">Resume Intake</div>
+    <div class="topbar-right">
+      <a class="btn secondary small" href="{{ url_for('dashboard') }}">Upload</a>
+      <a class="btn secondary small" href="{{ url_for('requirements') }}">Requirements</a>
+      <span class="who">Signed in as <strong>{{ session['username'] }}</strong></span>
+      <a class="btn secondary small" href="{{ url_for('logout') }}">Log out</a>
+    </div>
+  </div>
+</div>
+
+<div class="wrap">
+
+  <div class="hero">
+    <div class="eyebrow">Candidate search</div>
+    <h1>Find candidates<br><span class="hl">by any field.</span></h1>
+    <p class="sub">Filter by name, location, visa status, title, skills, or email. Combine as many as you like — results match all filters you fill in.</p>
+  </div>
+
+  <form method="GET" class="filter-panel">
+    <div class="filter-grid">
+      <div>
+        <label>Name</label>
+        <input type="text" name="name" value="{{ args.get('name', '') }}" placeholder="e.g. Martich">
+      </div>
+      <div>
+        <label>Location</label>
+        <input type="text" name="location" value="{{ args.get('location', '') }}" placeholder="e.g. Austin, TX">
+      </div>
+      <div>
+        <label>Visa Status</label>
+        <input type="text" name="visa_status" value="{{ args.get('visa_status', '') }}" placeholder="e.g. H-1B, US Citizen">
+      </div>
+      <div>
+        <label>Title</label>
+        <input type="text" name="title" value="{{ args.get('title', '') }}" placeholder="e.g. Software Engineer">
+      </div>
+      <div>
+        <label>Skills</label>
+        <input type="text" name="skills" value="{{ args.get('skills', '') }}" placeholder="e.g. Python, AWS">
+      </div>
+      <div>
+        <label>Email</label>
+        <input type="text" name="email" value="{{ args.get('email', '') }}" placeholder="e.g. gmail.com">
+      </div>
+    </div>
+    <div class="filter-actions">
+      <button class="btn" type="submit">Search</button>
+      <a class="btn secondary" href="{{ url_for('search') }}">Clear</a>
+      {% if has_query %}
+        <a class="btn secondary" href="{{ url_for('export', **args) }}">Download these results as Excel</a>
+      {% endif %}
+    </div>
+  </form>
+
+  <div class="results-head">
+    <h4>{{ candidates|length }} candidate{{ '' if candidates|length == 1 else 's' }}{{ ' matching' if has_query else ' total' }}</h4>
+    {% if not has_query %}
+      <a class="btn" href="{{ url_for('export') }}">Download All as Excel</a>
+    {% endif %}
+  </div>
+
+  <table>
+    <thead>
+      <tr><th>Name</th><th>Title</th><th>Contact</th><th>Location</th><th>Visa Status</th><th>Experience</th><th>Skills</th><th></th></tr>
+    </thead>
+    <tbody>
+      {% for c in candidates %}
+      <tr>
+        <td><strong>{{ c['name'] or '—' }}</strong></td>
+        <td>{{ c['current_title'] or '—' }}</td>
+        <td>{{ c['email'] }}{% if c['phone'] %} · {{ c['phone'] }}{% endif %}</td>
+        <td>{{ c['location'] or '—' }}</td>
+        <td>{{ c['visa_status'] or '—' }}</td>
+        <td>{{ c['years_experience'] or '—' }}</td>
+        <td class="skills-cell">{{ c['skills'] or '—' }}</td>
+        <td>
+          <form method="POST" action="{{ url_for('delete_candidate', candidate_id=c['id']) }}" onsubmit="return confirm('Remove this candidate?');">
+            <button class="link-btn" type="submit">Remove</button>
+          </form>
+        </td>
+      </tr>
+      {% else %}
+      <tr class="empty-row"><td colspan="8">{{ 'No candidates match those filters.' if has_query else 'No resumes uploaded yet.' }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+
+</div>
+</body>
+</html>
