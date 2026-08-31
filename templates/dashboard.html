@@ -12,6 +12,8 @@
   <div class="topbar-inner">
     <div class="brand">Resume Intake</div>
     <div class="topbar-right">
+      <a class="btn secondary small" href="{{ url_for('requirements') }}">Requirements</a>
+      <a class="btn secondary small" href="{{ url_for('search') }}">Search</a>
       <span class="who">Signed in as <strong>{{ session['username'] }}</strong></span>
       <a class="btn secondary small" href="{{ url_for('logout') }}">Log out</a>
     </div>
