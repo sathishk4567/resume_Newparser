@@ -29,7 +29,7 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
-app.config["MAX_CONTENT_LENGTH"] = 25 * 1024 * 1024  # 25MB per request
+app.config["MAX_CONTENT_LENGTH"] = 150 * 1024 * 1024  # 150MB per request (large batch uploads)
 
 ALLOWED_EXT = {".pdf", ".docx"}
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
@@ -717,7 +717,7 @@ def handle_500(e):
 def handle_413(e):
     if request.path.startswith("/upload"):
         return jsonify({"results": [{"filename": "", "status": "error",
-                                      "reason": "File too large (25MB limit per request)"}]}), 413
+                                      "reason": "Batch too large (150MB limit per request — try uploading fewer files at once)"}]}), 413
     return e
 
 
