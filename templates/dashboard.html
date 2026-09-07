@@ -22,6 +22,7 @@
 
 <div class="wrap">
 
+  {% if session['is_admin'] %}
   <div class="hero">
     <div class="eyebrow">Batch resume intake</div>
     <h1>Upload resumes.<br><span class="hl">Everything lands here.</span></h1>
@@ -48,6 +49,13 @@
   <div class="queue" id="queue">
     <div class="rows" id="rows"></div>
   </div>
+  {% else %}
+  <div class="hero">
+    <div class="eyebrow">Candidate database</div>
+    <h1>Browse and search<br><span class="hl">what's already in.</span></h1>
+    <p class="sub">Uploading is limited to admins. Head to Search to look up candidates, or download the full list as Excel below.</p>
+  </div>
+  {% endif %}
 
   <div class="results-head">
     <h4>Candidates ({{ candidates|length }})</h4>
@@ -84,6 +92,7 @@
   </table>
   <p class="note">Visa status is only filled in when a resume explicitly states work authorization (e.g. "US Citizen," "H-1B," "requires sponsorship") — it's never guessed from a name or location.</p>
 
+  {% if session['is_admin'] %}
   <details class="team-panel">
     <summary>Add a teammate</summary>
     <form method="POST" action="{{ url_for('add_user') }}" class="inline-form">
@@ -92,7 +101,9 @@
       <button class="btn secondary" type="submit">Add</button>
     </form>
     <p class="hint">Current users: {{ users|map(attribute='username')|join(', ') }}</p>
+    <p class="hint">New teammates can search and export, but only admins can upload.</p>
   </details>
+  {% endif %}
 
 </div>
 
@@ -103,14 +114,16 @@ const folderInput = document.getElementById('folderInput');
 const queueEl = document.getElementById('queue');
 const rowsEl = document.getElementById('rows');
 
-document.getElementById('chooseFilesBtn').onclick = () => fileInput.click();
-document.getElementById('chooseFolderBtn').onclick = () => folderInput.click();
-fileInput.onchange = e => handleFiles(e.target.files);
-folderInput.onchange = e => handleFiles(e.target.files);
+if(tray && fileInput && folderInput){
+  document.getElementById('chooseFilesBtn').onclick = () => fileInput.click();
+  document.getElementById('chooseFolderBtn').onclick = () => folderInput.click();
+  fileInput.onchange = e => handleFiles(e.target.files);
+  folderInput.onchange = e => handleFiles(e.target.files);
 
-['dragenter','dragover'].forEach(ev => tray.addEventListener(ev, e => { e.preventDefault(); tray.classList.add('drag'); }));
-['dragleave','drop'].forEach(ev => tray.addEventListener(ev, e => { e.preventDefault(); tray.classList.remove('drag'); }));
-tray.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+  ['dragenter','dragover'].forEach(ev => tray.addEventListener(ev, e => { e.preventDefault(); tray.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(ev => tray.addEventListener(ev, e => { e.preventDefault(); tray.classList.remove('drag'); }));
+  tray.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+}
 
 function escapeHtml(str){
   return (str||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
