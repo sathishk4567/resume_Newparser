@@ -3,6 +3,8 @@ import re
 import io
 import json
 import sqlite3
+import threading
+import secrets
 from datetime import datetime
 from functools import wraps
 
@@ -13,7 +15,7 @@ from flask import (
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 
-import pdfplumber
+from pypdf import PdfReader
 import docx
 import openpyxl
 from openpyxl.utils import get_column_letter
@@ -35,8 +37,10 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # ---------------------------------------------------------------- database
 def get_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=15000")
     return conn
 
 
@@ -65,7 +69,8 @@ def init_db():
         summary TEXT,
         visa_status TEXT,
         uploaded_by TEXT,
-        uploaded_at TEXT
+        uploaded_at TEXT,
+        status TEXT DEFAULT 'done'
     );
 
     CREATE TABLE IF NOT EXISTS experience (
@@ -90,6 +95,13 @@ def init_db():
         created_by TEXT,
         created_at TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token TEXT PRIMARY KEY,
+        user_id INTEGER NOT NULL,
+        username TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
     """)
     conn.commit()
 
@@ -97,6 +109,9 @@ def init_db():
     existing_cols = [r["name"] for r in conn.execute("PRAGMA table_info(candidates)").fetchall()]
     if "visa_status" not in existing_cols:
         conn.execute("ALTER TABLE candidates ADD COLUMN visa_status TEXT")
+        conn.commit()
+    if "status" not in existing_cols:
+        conn.execute("ALTER TABLE candidates ADD COLUMN status TEXT DEFAULT 'done'")
         conn.commit()
 
     existing = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
@@ -117,6 +132,23 @@ def login_required(f):
     def wrapper(*args, **kwargs):
         if not session.get("user_id"):
             return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def api_login_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        if not token:
+            return jsonify({"error": "Missing bearer token"}), 401
+        conn = get_db()
+        row = conn.execute("SELECT * FROM api_tokens WHERE token = ?", (token,)).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Invalid or expired token"}), 401
+        request.api_username = row["username"]
         return f(*args, **kwargs)
     return wrapper
 
@@ -224,9 +256,12 @@ def extract_text(filepath):
     ext = os.path.splitext(filepath)[1].lower()
     if ext == ".pdf":
         parts = []
-        with pdfplumber.open(filepath) as pdf:
-            for page in pdf.pages:
+        reader = PdfReader(filepath, strict=False)
+        for page in reader.pages[:25]:  # resumes are short; cap bounds worst-case memory/time
+            try:
                 parts.append(page.extract_text() or "")
+            except Exception:
+                continue
         return "\n".join(parts)
     elif ext == ".docx":
         d = docx.Document(filepath)
@@ -367,7 +402,8 @@ def build_candidate_filter(args):
         if val:
             clauses.append(f"{col} LIKE ?")
             params.append(f"%{val}%")
-    where_sql = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    clauses.append("status = 'done'")
+    where_sql = " WHERE " + " AND ".join(clauses)
     return where_sql, params
 
 
@@ -527,7 +563,9 @@ def view_requirement(req_id):
         conn.close()
         flash("That saved requirement no longer exists.")
         return redirect(url_for("requirements"))
-    candidates = conn.execute("SELECT * FROM candidates ORDER BY uploaded_at DESC").fetchall()
+    candidates = conn.execute(
+        "SELECT * FROM candidates WHERE status='done' ORDER BY uploaded_at DESC"
+    ).fetchall()
     saved = conn.execute("SELECT * FROM requirements ORDER BY created_at DESC").fetchall()
     conn.close()
     matches = score_candidates_against_requirement(current, candidates)
@@ -549,11 +587,60 @@ def delete_requirement(req_id):
 @login_required
 def dashboard():
     conn = get_db()
-    candidates = conn.execute("SELECT * FROM candidates ORDER BY uploaded_at DESC").fetchall()
+    candidates = conn.execute(
+        "SELECT * FROM candidates WHERE status='done' ORDER BY uploaded_at DESC"
+    ).fetchall()
     users = conn.execute("SELECT username FROM users ORDER BY username").fetchall()
     conn.close()
     return render_template("dashboard.html", candidates=candidates, users=users,
                             ai_enabled=bool(ANTHROPIC_API_KEY))
+
+
+def process_resume(candidate_id, save_path, filename):
+    """Runs in a background thread: extract, parse, and update the placeholder row."""
+    conn = get_db()
+    try:
+        text = extract_text(save_path)
+        if not text or len(text.strip()) < 20:
+            raise ValueError("No readable text found (possibly a scanned/image-only file)")
+
+        if ANTHROPIC_API_KEY:
+            try:
+                parsed = parse_with_claude(text)
+            except Exception:
+                parsed = parse_heuristic(text)
+        else:
+            parsed = parse_heuristic(text)
+
+        conn.execute(
+            """UPDATE candidates SET name=?, email=?, phone=?, linkedin=?, location=?,
+               current_title=?, years_experience=?, education=?, skills=?, summary=?,
+               visa_status=?, status='done' WHERE id=?""",
+            (parsed.get("name", ""), parsed.get("email", ""), parsed.get("phone", ""),
+             parsed.get("linkedin", ""), parsed.get("location", ""), parsed.get("current_title", ""),
+             parsed.get("years_experience", ""), parsed.get("education", ""), parsed.get("skills", ""),
+             parsed.get("summary", ""), parsed.get("visa_status", ""), candidate_id)
+        )
+        for exp in parsed.get("experience", []):
+            conn.execute(
+                """INSERT INTO experience (candidate_id, title, company, dates, location, highlights)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (candidate_id, exp.get("title", ""), exp.get("company", ""), exp.get("dates", ""),
+                 exp.get("location", ""), exp.get("highlights", ""))
+            )
+        conn.commit()
+    except Exception as e:
+        conn.execute(
+            "UPDATE candidates SET status='error', name=? WHERE id=?",
+            (f"[Error: {str(e)[:150]}]", candidate_id)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+        try:
+            os.remove(save_path)
+        except OSError:
+            pass
 
 
 @app.route("/upload", methods=["POST"])
@@ -561,64 +648,61 @@ def dashboard():
 def upload():
     files = request.files.getlist("resumes")
     conn = get_db()
-    results = []
+    queued = []
+    username = session.get("username", "")
+
     for f in files:
         if not f or not f.filename:
             continue
-        save_path = None
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_EXT:
+            queued.append({"filename": f.filename, "id": None, "status": "skipped",
+                            "reason": "unsupported file type"})
+            continue
         try:
-            ext = os.path.splitext(f.filename)[1].lower()
-            if ext not in ALLOWED_EXT:
-                results.append({"filename": f.filename, "status": "skipped", "reason": "unsupported file type"})
-                continue
             safe_name = secure_filename(f.filename)
             save_path = os.path.join(UPLOAD_DIR, f"{datetime.utcnow().timestamp()}_{safe_name}")
             f.save(save_path)
 
-            text = extract_text(save_path)
-            if not text or len(text.strip()) < 20:
-                raise ValueError("No readable text found (possibly a scanned/image-only file)")
-
-            if ANTHROPIC_API_KEY:
-                try:
-                    parsed = parse_with_claude(text)
-                except Exception:
-                    parsed = parse_heuristic(text)
-            else:
-                parsed = parse_heuristic(text)
-
             cur = conn.execute(
-                """INSERT INTO candidates
-                (filename, name, email, phone, linkedin, location, current_title,
-                 years_experience, education, skills, summary, visa_status, uploaded_by, uploaded_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (f.filename, parsed.get("name", ""), parsed.get("email", ""), parsed.get("phone", ""),
-                 parsed.get("linkedin", ""), parsed.get("location", ""), parsed.get("current_title", ""),
-                 parsed.get("years_experience", ""), parsed.get("education", ""), parsed.get("skills", ""),
-                 parsed.get("summary", ""), parsed.get("visa_status", ""),
-                 session.get("username", ""), datetime.utcnow().isoformat())
+                """INSERT INTO candidates (filename, uploaded_by, uploaded_at, status)
+                   VALUES (?, ?, ?, 'processing')""",
+                (f.filename, username, datetime.utcnow().isoformat())
             )
-            candidate_id = cur.lastrowid
-            for exp in parsed.get("experience", []):
-                conn.execute(
-                    """INSERT INTO experience (candidate_id, title, company, dates, location, highlights)
-                    VALUES (?, ?, ?, ?, ?, ?)""",
-                    (candidate_id, exp.get("title", ""), exp.get("company", ""), exp.get("dates", ""),
-                     exp.get("location", ""), exp.get("highlights", ""))
-                )
             conn.commit()
-            results.append({"filename": f.filename, "status": "done"})
+            candidate_id = cur.lastrowid
+
+            thread = threading.Thread(
+                target=process_resume, args=(candidate_id, save_path, f.filename), daemon=True
+            )
+            thread.start()
+
+            queued.append({"filename": f.filename, "id": candidate_id, "status": "processing"})
         except Exception as e:
-            conn.rollback()
-            results.append({"filename": f.filename, "status": "error", "reason": str(e)[:200]})
-        finally:
-            if save_path:
-                try:
-                    os.remove(save_path)
-                except OSError:
-                    pass
+            queued.append({"filename": f.filename, "id": None, "status": "error",
+                            "reason": str(e)[:150]})
     conn.close()
-    return jsonify({"results": results})
+    return jsonify({"results": queued})
+
+
+@app.route("/upload/status")
+@login_required
+def upload_status():
+    ids_param = request.args.get("ids", "")
+    ids = [int(i) for i in ids_param.split(",") if i.strip().isdigit()]
+    if not ids:
+        return jsonify({"results": []})
+    conn = get_db()
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT id, filename, name, status FROM candidates WHERE id IN ({placeholders})", ids
+    ).fetchall()
+    conn.close()
+    return jsonify({"results": [
+        {"id": r["id"], "filename": r["filename"], "status": r["status"],
+         "reason": r["name"] if r["status"] == "error" else None}
+        for r in rows
+    ]})
 
 
 @app.errorhandler(500)
@@ -697,6 +781,197 @@ def export():
     buf.seek(0)
     return send_file(buf, as_attachment=True, download_name="Resumes_Parsed.xlsx",
                       mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+# ==================================================================
+# JSON API — used by the Expo mobile app (token auth, no cookies)
+# ==================================================================
+
+@app.route("/api/login", methods=["POST"])
+def api_login():
+    data = request.get_json(silent=True) or request.form
+    username = (data.get("username") or "").strip()
+    password = data.get("password") or ""
+    conn = get_db()
+    user = conn.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if not user or not check_password_hash(user["password_hash"], password):
+        conn.close()
+        return jsonify({"error": "Incorrect username or password"}), 401
+    token = secrets.token_hex(32)
+    conn.execute(
+        "INSERT INTO api_tokens (token, user_id, username, created_at) VALUES (?, ?, ?, ?)",
+        (token, user["id"], user["username"], datetime.utcnow().isoformat())
+    )
+    conn.commit()
+    conn.close()
+    return jsonify({"token": token, "username": user["username"]})
+
+
+@app.route("/api/logout", methods=["POST"])
+@api_login_required
+def api_logout():
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    conn = get_db()
+    conn.execute("DELETE FROM api_tokens WHERE token = ?", (token,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/candidates")
+@api_login_required
+def api_candidates():
+    where_sql, params = build_candidate_filter(request.args)
+    conn = get_db()
+    rows = conn.execute(
+        f"SELECT * FROM candidates{where_sql} ORDER BY uploaded_at DESC", params
+    ).fetchall()
+    conn.close()
+    return jsonify({"candidates": [dict(r) for r in rows]})
+
+
+@app.route("/api/candidates/<int:candidate_id>", methods=["DELETE"])
+@api_login_required
+def api_delete_candidate(candidate_id):
+    conn = get_db()
+    conn.execute("DELETE FROM experience WHERE candidate_id = ?", (candidate_id,))
+    conn.execute("DELETE FROM candidates WHERE id = ?", (candidate_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/upload", methods=["POST"])
+@api_login_required
+def api_upload():
+    files = request.files.getlist("resumes")
+    conn = get_db()
+    queued = []
+    username = request.api_username
+
+    for f in files:
+        if not f or not f.filename:
+            continue
+        ext = os.path.splitext(f.filename)[1].lower()
+        if ext not in ALLOWED_EXT:
+            queued.append({"filename": f.filename, "id": None, "status": "skipped",
+                            "reason": "unsupported file type"})
+            continue
+        try:
+            safe_name = secure_filename(f.filename)
+            save_path = os.path.join(UPLOAD_DIR, f"{datetime.utcnow().timestamp()}_{safe_name}")
+            f.save(save_path)
+
+            cur = conn.execute(
+                """INSERT INTO candidates (filename, uploaded_by, uploaded_at, status)
+                   VALUES (?, ?, ?, 'processing')""",
+                (f.filename, username, datetime.utcnow().isoformat())
+            )
+            conn.commit()
+            candidate_id = cur.lastrowid
+
+            thread = threading.Thread(
+                target=process_resume, args=(candidate_id, save_path, f.filename), daemon=True
+            )
+            thread.start()
+
+            queued.append({"filename": f.filename, "id": candidate_id, "status": "processing"})
+        except Exception as e:
+            queued.append({"filename": f.filename, "id": None, "status": "error",
+                            "reason": str(e)[:150]})
+    conn.close()
+    return jsonify({"results": queued})
+
+
+@app.route("/api/upload/status")
+@api_login_required
+def api_upload_status():
+    ids_param = request.args.get("ids", "")
+    ids = [int(i) for i in ids_param.split(",") if i.strip().isdigit()]
+    if not ids:
+        return jsonify({"results": []})
+    conn = get_db()
+    placeholders = ",".join("?" * len(ids))
+    rows = conn.execute(
+        f"SELECT id, filename, name, status FROM candidates WHERE id IN ({placeholders})", ids
+    ).fetchall()
+    conn.close()
+    return jsonify({"results": [
+        {"id": r["id"], "filename": r["filename"], "status": r["status"],
+         "reason": r["name"] if r["status"] == "error" else None}
+        for r in rows
+    ]})
+
+
+@app.route("/api/requirements", methods=["GET", "POST"])
+@api_login_required
+def api_requirements():
+    conn = get_db()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        raw_text = (data.get("raw_text") or "").strip()
+        if not raw_text:
+            conn.close()
+            return jsonify({"error": "raw_text is required"}), 400
+
+        if ANTHROPIC_API_KEY:
+            try:
+                parsed = parse_requirement_with_claude(raw_text)
+            except Exception:
+                parsed = parse_requirement_heuristic(raw_text)
+        else:
+            parsed = parse_requirement_heuristic(raw_text)
+
+        label = (parsed.get("title") or raw_text[:60]).strip()
+        cur = conn.execute(
+            """INSERT INTO requirements (label, raw_text, title, location, skills, visa_status,
+               created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (label, raw_text, parsed.get("title", ""), parsed.get("location", ""),
+             parsed.get("skills", ""), parsed.get("visa_status", ""),
+             request.api_username, datetime.utcnow().isoformat())
+        )
+        conn.commit()
+        req_id = cur.lastrowid
+        conn.close()
+        return jsonify({"id": req_id, "label": label, **parsed})
+
+    saved = conn.execute("SELECT * FROM requirements ORDER BY created_at DESC").fetchall()
+    conn.close()
+    return jsonify({"requirements": [dict(r) for r in saved]})
+
+
+@app.route("/api/requirements/<int:req_id>")
+@api_login_required
+def api_view_requirement(req_id):
+    conn = get_db()
+    current = conn.execute("SELECT * FROM requirements WHERE id = ?", (req_id,)).fetchone()
+    if not current:
+        conn.close()
+        return jsonify({"error": "Not found"}), 404
+    candidates = conn.execute(
+        "SELECT * FROM candidates WHERE status='done' ORDER BY uploaded_at DESC"
+    ).fetchall()
+    conn.close()
+    matches = score_candidates_against_requirement(current, candidates)
+    return jsonify({
+        "requirement": dict(current),
+        "matches": [
+            {"candidate": dict(m["candidate"]), "match_count": m["match_count"],
+             "matched_skills": m["matched_skills"]}
+            for m in matches
+        ]
+    })
+
+
+@app.route("/api/requirements/<int:req_id>", methods=["DELETE"])
+@api_login_required
+def api_delete_requirement(req_id):
+    conn = get_db()
+    conn.execute("DELETE FROM requirements WHERE id = ?", (req_id,))
+    conn.commit()
+    conn.close()
+    return jsonify({"ok": True})
 
 
 init_db()
