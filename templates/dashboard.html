@@ -116,6 +116,8 @@ function escapeHtml(str){
   return (str||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+const CHUNK_SIZE = 10; // files per request — keeps each request small and robust
+
 async function handleFiles(fileList){
   const valid = Array.from(fileList).filter(f => /\.pdf$/i.test(f.name) || /\.docx$/i.test(f.name));
   if(!valid.length) return;
@@ -125,29 +127,107 @@ async function handleFiles(fileList){
     <div class="row" id="row-${i}">
       <div class="dot working"></div>
       <div class="name">${escapeHtml(f.name)}</div>
-      <div class="status working">Uploading…</div>
+      <div class="status working">Queued…</div>
     </div>
   `).join('');
 
-  const formData = new FormData();
-  valid.forEach(f => formData.append('resumes', f));
-
-  try{
-    const resp = await fetch('/upload', { method: 'POST', body: formData });
-    const data = await resp.json();
-    (data.results || []).forEach((r, i) => {
-      const row = document.getElementById(`row-${i}`);
-      if(!row) return;
-      const dot = row.querySelector('.dot');
-      const status = row.querySelector('.status');
-      dot.className = 'dot ' + (r.status === 'done' ? 'done' : 'error');
-      status.className = 'status ' + (r.status === 'done' ? 'done' : 'error');
-      status.textContent = r.status === 'done' ? 'Done' : (r.reason || 'Error');
-    });
-    setTimeout(() => window.location.reload(), 900);
-  }catch(err){
-    rowsEl.innerHTML = `<div class="row"><div class="dot error"></div><div class="name">Upload failed</div><div class="status error">${escapeHtml(err.message)}</div></div>`;
+  // split into chunks so one giant request can't fail all-or-nothing
+  const chunks = [];
+  for(let i = 0; i < valid.length; i += CHUNK_SIZE){
+    chunks.push(valid.slice(i, i + CHUNK_SIZE));
   }
+
+  const idToRow = {};
+  const allPollIds = [];
+  let rowOffset = 0;
+
+  for(const chunk of chunks){
+    const chunkIndexes = chunk.map((_, i) => rowOffset + i);
+    chunkIndexes.forEach(i => {
+      const row = document.getElementById(`row-${i}`);
+      if(row) row.querySelector('.status').textContent = 'Uploading…';
+    });
+
+    const formData = new FormData();
+    chunk.forEach(f => formData.append('resumes', f));
+
+    try{
+      const resp = await fetch('/upload', { method: 'POST', body: formData });
+      const text = await resp.text();
+      let data;
+      try { data = JSON.parse(text); }
+      catch(parseErr){ throw new Error('Server returned an invalid response for this batch'); }
+
+      const results = data.results || [];
+      results.forEach((r, j) => {
+        const i = chunkIndexes[j];
+        const row = document.getElementById(`row-${i}`);
+        if(!row) return;
+        const dot = row.querySelector('.dot');
+        const status = row.querySelector('.status');
+        const cls = r.status === 'processing' ? 'working' : r.status === 'done' ? 'done' : 'error';
+        dot.className = 'dot ' + cls;
+        status.className = 'status ' + cls;
+        status.textContent = r.status === 'processing' ? 'Parsing…'
+          : r.status === 'skipped' ? (r.reason || 'Skipped')
+          : r.status === 'done' ? 'Done' : (r.reason || 'Error');
+        if(r.status === 'processing' && r.id){
+          idToRow[r.id] = i;
+          allPollIds.push(r.id);
+        }
+      });
+    }catch(err){
+      chunkIndexes.forEach(i => {
+        const row = document.getElementById(`row-${i}`);
+        if(!row) return;
+        row.querySelector('.dot').className = 'dot error';
+        const status = row.querySelector('.status');
+        status.className = 'status error';
+        status.textContent = err.message || 'Upload failed for this batch';
+      });
+    }
+
+    rowOffset += chunk.length;
+  }
+
+  if(!allPollIds.length) return;
+
+  let attempts = 0;
+  const maxAttempts = 120; // ~3 minutes at 1.5s intervals
+  const poll = setInterval(async () => {
+    attempts++;
+    try{
+      // poll in groups of 50 ids to keep the status URL a sane length
+      const stillPending = allPollIds.filter(id => idToRow[id] !== undefined);
+      for(let i = 0; i < stillPending.length; i += 50){
+        const idsGroup = stillPending.slice(i, i + 50);
+        const resp = await fetch(`/upload/status?ids=${idsGroup.join(',')}`);
+        const data = await resp.json();
+        (data.results || []).forEach(r => {
+          const rowIndex = idToRow[r.id];
+          if(rowIndex === undefined) return;
+          const row = document.getElementById(`row-${rowIndex}`);
+          if(!row) return;
+          if(r.status !== 'processing'){
+            const dot = row.querySelector('.dot');
+            const status = row.querySelector('.status');
+            dot.className = 'dot ' + (r.status === 'done' ? 'done' : 'error');
+            status.className = 'status ' + (r.status === 'done' ? 'done' : 'error');
+            status.textContent = r.status === 'done' ? 'Done' : (r.reason || 'Error');
+            delete idToRow[r.id]; // stop tracking once settled
+          }
+        });
+      }
+      const allSettled = Object.keys(idToRow).length === 0;
+      if(allSettled || attempts >= maxAttempts){
+        clearInterval(poll);
+        setTimeout(() => window.location.reload(), 700);
+      }
+    }catch(err){
+      // network hiccup mid-poll — keep trying until maxAttempts
+      if(attempts >= maxAttempts) clearInterval(poll);
+    }
+  }, 1500);
 }
 
 document.getElementById('searchBox').addEventListener('input', e => {
