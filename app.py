@@ -395,7 +395,6 @@ def build_candidate_filter(args):
         "visa_status": "visa_status",
         "skills": "skills",
         "title": "current_title",
-        "email": "email",
     }
     for arg_key, col in field_map.items():
         val = (args.get(arg_key) or "").strip()
@@ -417,7 +416,7 @@ def search():
     ).fetchall()
     conn.close()
     has_query = any((request.args.get(k) or "").strip() for k in
-                     ["name", "location", "visa_status", "skills", "title", "email"])
+                     ["name", "location", "visa_status", "skills", "title"])
     return render_template("search.html", candidates=candidates, args=request.args, has_query=has_query)
 
 
