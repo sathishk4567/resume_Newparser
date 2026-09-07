@@ -43,9 +43,12 @@ body{
 
 /* ---------- Top bar ---------- */
 .topbar{background:var(--ink);color:var(--paper);}
-.topbar-inner{max-width:1040px;margin:0 auto;padding:14px 28px;display:flex;justify-content:space-between;align-items:center;}
+.topbar-inner{max-width:1040px;margin:0 auto;padding:14px 28px;display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;row-gap:10px;}
 .brand{font-family:'Fraunces',serif;font-weight:500;font-size:17px;}
-.topbar-right{display:flex;align-items:center;gap:16px;}
+.topbar-right{display:flex;align-items:center;gap:16px;flex-wrap:wrap;row-gap:8px;}
+@media (max-width: 560px){
+  .topbar-right .who{display:none;}
+}
 .who{font-size:13px;opacity:.8;}
 
 /* ---------- Layout ---------- */
