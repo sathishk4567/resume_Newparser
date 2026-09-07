@@ -143,6 +143,15 @@ def init_db():
             (admin_user,)
         )
         conn.commit()
+        # safety net: if ADMIN_USERNAME doesn't match any existing account (e.g. it was
+        # changed or never matched the real login), don't leave every account stranded
+        # without upload access — promote whoever was created first instead.
+        admin_count = conn.execute("SELECT COUNT(*) as c FROM users WHERE is_admin = 1").fetchone()["c"]
+        if admin_count == 0:
+            conn.execute(
+                "UPDATE users SET is_admin = 1 WHERE id = (SELECT MIN(id) FROM users)"
+            )
+            conn.commit()
     conn.close()
 
 
