@@ -51,6 +51,7 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
     );
 
@@ -100,6 +101,7 @@ def init_db():
         token TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL,
         username TEXT NOT NULL,
+        is_admin INTEGER DEFAULT 0,
         created_at TEXT NOT NULL
     );
     """)
@@ -114,13 +116,31 @@ def init_db():
         conn.execute("ALTER TABLE candidates ADD COLUMN status TEXT DEFAULT 'done'")
         conn.commit()
 
+    # migration: add is_admin to users table if this DB predates the column
+    existing_user_cols = [r["name"] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+    if "is_admin" not in existing_user_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+        conn.commit()
+
+    existing_token_cols = [r["name"] for r in conn.execute("PRAGMA table_info(api_tokens)").fetchall()]
+    if "is_admin" not in existing_token_cols:
+        conn.execute("ALTER TABLE api_tokens ADD COLUMN is_admin INTEGER DEFAULT 0")
+        conn.commit()
+
     existing = conn.execute("SELECT COUNT(*) as c FROM users").fetchone()["c"]
+    admin_user = os.environ.get("ADMIN_USERNAME", "admin")
     if existing == 0:
-        admin_user = os.environ.get("ADMIN_USERNAME", "admin")
         admin_pass = os.environ.get("ADMIN_PASSWORD", "changeme123")
         conn.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, 1, ?)",
             (admin_user, generate_password_hash(admin_pass), datetime.utcnow().isoformat())
+        )
+        conn.commit()
+    else:
+        # already-deployed DBs: make sure the original admin account is flagged as admin
+        conn.execute(
+            "UPDATE users SET is_admin = 1 WHERE username = ? AND is_admin = 0",
+            (admin_user,)
         )
         conn.commit()
     conn.close()
@@ -132,6 +152,18 @@ def login_required(f):
     def wrapper(*args, **kwargs):
         if not session.get("user_id"):
             return redirect(url_for("login"))
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        if not session.get("user_id"):
+            return redirect(url_for("login"))
+        if not session.get("is_admin"):
+            flash("Only an admin can do that.")
+            return redirect(url_for("dashboard"))
         return f(*args, **kwargs)
     return wrapper
 
@@ -149,6 +181,27 @@ def api_login_required(f):
         if not row:
             return jsonify({"error": "Invalid or expired token"}), 401
         request.api_username = row["username"]
+        request.api_is_admin = bool(row["is_admin"])
+        return f(*args, **kwargs)
+    return wrapper
+
+
+def api_admin_required(f):
+    @wraps(f)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get("Authorization", "")
+        token = auth[7:] if auth.startswith("Bearer ") else ""
+        if not token:
+            return jsonify({"error": "Missing bearer token"}), 401
+        conn = get_db()
+        row = conn.execute("SELECT * FROM api_tokens WHERE token = ?", (token,)).fetchone()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Invalid or expired token"}), 401
+        if not row["is_admin"]:
+            return jsonify({"error": "Admin access required"}), 403
+        request.api_username = row["username"]
+        request.api_is_admin = True
         return f(*args, **kwargs)
     return wrapper
 
@@ -164,6 +217,7 @@ def login():
         if user and check_password_hash(user["password_hash"], password):
             session["user_id"] = user["id"]
             session["username"] = user["username"]
+            session["is_admin"] = bool(user["is_admin"])
             return redirect(url_for("dashboard"))
         flash("Incorrect username or password.")
     return render_template("login.html")
@@ -176,7 +230,7 @@ def logout():
 
 
 @app.route("/users/add", methods=["POST"])
-@login_required
+@admin_required
 def add_user():
     username = request.form.get("username", "").strip()
     password = request.form.get("password", "")
@@ -186,11 +240,11 @@ def add_user():
     conn = get_db()
     try:
         conn.execute(
-            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            "INSERT INTO users (username, password_hash, is_admin, created_at) VALUES (?, ?, 0, ?)",
             (username, generate_password_hash(password), datetime.utcnow().isoformat())
         )
         conn.commit()
-        flash(f"Added teammate '{username}'.")
+        flash(f"Added teammate '{username}' (can search & export, not upload).")
     except sqlite3.IntegrityError:
         flash("That username already exists.")
     conn.close()
@@ -645,6 +699,9 @@ def process_resume(candidate_id, save_path, filename):
 @app.route("/upload", methods=["POST"])
 @login_required
 def upload():
+    if not session.get("is_admin"):
+        return jsonify({"results": [{"filename": "", "status": "error",
+                                      "reason": "Only an admin can upload resumes."}]}), 403
     files = request.files.getlist("resumes")
     conn = get_db()
     queued = []
@@ -798,12 +855,12 @@ def api_login():
         return jsonify({"error": "Incorrect username or password"}), 401
     token = secrets.token_hex(32)
     conn.execute(
-        "INSERT INTO api_tokens (token, user_id, username, created_at) VALUES (?, ?, ?, ?)",
-        (token, user["id"], user["username"], datetime.utcnow().isoformat())
+        "INSERT INTO api_tokens (token, user_id, username, is_admin, created_at) VALUES (?, ?, ?, ?, ?)",
+        (token, user["id"], user["username"], int(bool(user["is_admin"])), datetime.utcnow().isoformat())
     )
     conn.commit()
     conn.close()
-    return jsonify({"token": token, "username": user["username"]})
+    return jsonify({"token": token, "username": user["username"], "is_admin": bool(user["is_admin"])})
 
 
 @app.route("/api/logout", methods=["POST"])
@@ -842,7 +899,7 @@ def api_delete_candidate(candidate_id):
 
 
 @app.route("/api/upload", methods=["POST"])
-@api_login_required
+@api_admin_required
 def api_upload():
     files = request.files.getlist("resumes")
     conn = get_db()
